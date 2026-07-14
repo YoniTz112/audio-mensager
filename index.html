@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AirDrop Acústico - Pro Edition</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background-color: #0f172a; color: #f8fafc; font-family: 'Inter', sans-serif; }
+        .glass-panel { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(10px); border: 1px solid rgba(255, 255, 255, 0.1); }
+        canvas { width: 100%; height: 120px; background: #020617; border-radius: 0.5rem; border: 1px solid #334155; }
+        
+        /* Efeito de pulso para quando estiver gravando */
+        .recording-pulse { animation: pulse-red 1.5s infinite; }
+        @keyframes pulse-red {
+            0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
+            70% { box-shadow: 0 0 0 15px rgba(239, 68, 68, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+        }
+    </style>
+</head>
+<body class="min-h-screen p-6 flex flex-col items-center justify-center">
+
+    <div class="max-w-2xl w-full space-y-6">
+        <!-- Header -->
+        <div class="text-center space-y-2">
+            <h1 class="text-3xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-emerald-400">
+                AirDrop Acústico
+            </h1>
+            <p class="text-slate-400 text-sm">Transmissão de dados offline usando frequências de som (MFSK).</p>
+        </div>
+
+        <!-- Transmissor -->
+        <div class="glass-panel p-6 rounded-2xl space-y-4 shadow-xl">
+            <h2 class="text-xl font-semibold text-blue-400 flex items-center gap-2">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5.882V19.24a1.76 1.76 0 01-3.417.592l-2.147-6.15M18 13a3 3 0 100-6M5.436 13.683A4.001 4.001 0 017 6h1.832c4.1 0 7.625-1.234 9.168-3v14c-1.543-1.766-5.067-3-9.168-3H7a3.988 3.988 0 01-1.564-.317z"></path></svg>
+                Emissor
+            </h2>
+            <textarea id="tx-input" rows="3" class="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-white focus:outline-none focus:border-blue-500 transition-colors" placeholder="Digite sua mensagem secreta aqui..."></textarea>
+            <button id="btn-send" class="w-full bg-blue-600 hover:bg-blue-500 text-white font-semibold py-3 px-4 rounded-lg transition-all active:scale-95 shadow-[0_0_15px_rgba(37,99,235,0.4)]">
+                Emitir Áudio
+            </button>
+            <div id="tx-status" class="text-sm text-blue-300 hidden">Transmitindo...</div>
+        </div>
+
+        <!-- Receptor -->
+        <div class="glass-panel p-6 rounded-2xl space-y-4 shadow-xl">
+            <h2 class="text-xl font-semibold text-emerald-400 flex items-center gap-2">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"></path></svg>
+                Receptor (Filtro de Ruído Ativo)
+            </h2>
+            
+            <button id="btn-receive" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-semibold py-3 px-4 rounded-lg transition-all shadow-[0_0_15px_rgba(16,185,129,0.4)]">
+                Ativar Escuta Passiva
+            </button>
+
+            <!-- Espectrograma Visual -->
+            <canvas id="visualizer"></canvas>
+
+            <div class="bg-slate-900 border border-slate-700 rounded-lg p-4 min-h-[100px]">
+                <span class="text-xs text-slate-500 uppercase font-bold tracking-wider mb-2 block">Mensagem Recebida:</span>
+                <div id="rx-output" class="text-lg text-emerald-300 font-mono break-words"></div>
+            </div>
+            <button id="btn-clear" class="text-xs text-slate-400 hover:text-white transition">Limpar Mensagem</button>
+        </div>
+        
+        <!-- Explicação do Filtro -->
+        <div class="text-xs text-slate-500 text-center px-4">
+            * O sistema utiliza um <strong>Filtro Passa-Alta (Highpass Biquad Filter)</strong> em 2.500Hz para eliminar ruídos de fundo (conversas, vento, trânsito) e opera na faixa de 3.000Hz a 6.800Hz para garantir robustez.
+        </div>
+    </div>
+
+    <script>
+        /**
+         * PROTOCOLO DE COMUNICAÇÃO (MFSK - Multiple Frequency-Shift Keying)
+         * Ao invés de binário simples (sujeito a muito erro de tempo em JS), 
+         * mapeamos cada caractere para uma frequência específica acima da voz humana.
+         */
+        const PROTOCOL = {
+            FREQ_SEPARATOR: 2500, // Tom tocado entre letras para separar caracteres repetidos
+            FREQ_BASE: 3000,      // Frequência inicial (acima da maioria dos ruídos de fundo)
+            FREQ_STEP: 30,        // Distância entre cada caractere (Hz)
+            DURATION: 150,        // Duração de cada bipe (ms)
+            SEP_DURATION: 50,     // Duração do separador (ms)
+            AMP_THRESHOLD: 220    // Volume mínimo (0-255) para considerar como dado válido (Filtro de Ruído 2)
+        };
+
+        let audioCtx = null;
+        let analyser = null;
+        let mediaStream = null;
+        let isReceiving = false;
+        let animationId = null;
+
+        // Elementos da UI
+        const txInput = document.getElementById('tx-input');
+        const btnSend = document.getElementById('btn-send');
+        const txStatus = document.getElementById('tx-status');
+        const btnReceive = document.getElementById('btn-receive');
+        const rxOutput = document.getElementById('rx-output');
+        const canvas = document.getElementById('visualizer');
+        const canvasCtx = canvas.getContext('2d');
+
+        // Inicializa o Contexto de Áudio de forma segura
+        function initAudio() {
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+        }
+
+        // ==========================================
+        // SISTEMA EMISSOR (TRANSMITTER)
+        // ==========================================
+        async function playTone(freq, duration) {
+            return new Promise(resolve => {
+                const osc = audioCtx.createOscillator();
+                const gain = audioCtx.createGain();
+                
+                osc.type = 'sine'; // Onda senoidal pura é melhor para FFT
+                osc.frequency.value = freq;
+                
+                // Suavização (envelope) para evitar estalos de áudio
+                gain.gain.setValueAtTime(0, audioCtx.currentTime);
+                gain.gain.linearRampToValueAtTime(1, audioCtx.currentTime + 0.02);
+                gain.gain.setValueAtTime(1, audioCtx.currentTime + (duration/1000) - 0.02);
+                gain.gain.linearRampToValueAtTime(0, audioCtx.currentTime + (duration/1000));
+
+                osc.connect(gain);
+                gain.connect(audioCtx.destination);
+                
+                osc.start();
+                osc.stop(audioCtx.currentTime + (duration / 1000));
+                
+                setTimeout(resolve, duration);
+            });
+        }
+
+        btnSend.addEventListener('click', async () => {
+            const text = txInput.value.trim();
+            if (!text) return;
+
+            initAudio();
+            btnSend.disabled = true;
+            btnSend.classList.add('opacity-50');
+            txStatus.classList.remove('hidden');
+
+            for (let i = 0; i < text.length; i++) {
+                const charCode = text.charCodeAt(i);
+                
+                // Ignora caracteres fora da tabela ASCII básica para manter a precisão do protótipo
+                if (charCode > 127) continue; 
+
+                const freq = PROTOCOL.FREQ_BASE + (charCode * PROTOCOL.FREQ_STEP);
+                
+                // Toca a frequência do caractere
+                await playTone(freq, PROTOCOL.DURATION);
+                
+                // Toca o separador (silêncio audível de controle)
+                await playTone(PROTOCOL.FREQ_SEPARATOR, PROTOCOL.SEP_DURATION);
+            }
+
+            btnSend.disabled = false;
+            btnSend.classList.remove('opacity-50');
+            txStatus.classList.add('hidden');
+        });
+
+
+        // ==========================================
+        // SISTEMA RECEPTOR E FILTRO DE RUÍDO (RECEIVER)
+        // ==========================================
+        btnReceive.addEventListener('click', async () => {
+            initAudio();
+
+            if (isReceiving) {
+                stopReceiving();
+                return;
+            }
+
+            try {
+                // Solicita o microfone
+                mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false } });
+                const source = audioCtx.createMediaStreamSource(mediaStream);
+
+                // --- O SEGREDO PROFISSIONAL: FILTRAGEM DE RUÍDO (Hardware/API Level) ---
+                // Cria um filtro Passa-Alta. Isso literalmente deleta frequências abaixo de 2500Hz
+                // Portanto, vozes humanas, vento, passos, motores são ignorados ANTES da análise.
+                const highpassFilter = audioCtx.createBiquadFilter();
+                highpassFilter.type = 'highpass';
+                highpassFilter.frequency.value = 2500; 
+
+                analyser = audioCtx.createAnalyser();
+                analyser.fftSize = 2048; // Alta resolução (bins pequenos) para não confundir letras
+                analyser.smoothingTimeConstant = 0.2; // Pouca suavização para detectar mudanças rápidas
+
+                // Conecta: Microfone -> Filtro de Ruído -> Analisador (FFT)
+                source.connect(highpassFilter);
+                highpassFilter.connect(analyser);
+
+                isReceiving = true;
+                btnReceive.textContent = "Parar Escuta";
+                btnReceive.classList.replace('bg-emerald-600', 'bg-red-600');
+                btnReceive.classList.add('recording-pulse');
+
+                decodeAudio();
+                drawVisualizer();
+
+            } catch (err) {
+                alert("Erro ao acessar o microfone. Permissão negada ou hardware não encontrado.");
+                console.error(err);
+            }
+        });
+
+        function stopReceiving() {
+            isReceiving = false;
+            if (mediaStream) mediaStream.getTracks().forEach(track => track.stop());
+            cancelAnimationFrame(animationId);
+            
+            btnReceive.textContent = "Ativar Escuta Passiva";
+            btnReceive.classList.replace('bg-red-600', 'bg-emerald-600');
+            btnReceive.classList.remove('recording-pulse');
+        }
+
+        // Lógica de Decodificação Matemática
+        let lastChar = '';
+        let lastTime = 0;
+
+        function decodeAudio() {
+            if (!isReceiving) return;
+
+            const bufferLength = analyser.frequencyBinCount;
+            const dataArray = new Uint8Array(bufferLength);
+            analyser.getByteFrequencyData(dataArray);
+
+            const sampleRate = audioCtx.sampleRate;
+            const binSize = (sampleRate / 2) / bufferLength;
+
+            let maxAmp = 0;
+            let peakFreq = 0;
+
+            // Busca qual é a frequência mais alta tocando AGORA
+            // Começamos a varredura a partir de 2500Hz, economizando processamento e ignorando mais ruído
+            const startBin = Math.floor(2000 / binSize);
+            const endBin = Math.floor(7000 / binSize);
+
+            for (let i = startBin; i < endBin; i++) {
+                if (dataArray[i] > maxAmp) {
+                    maxAmp = dataArray[i];
+                    peakFreq = i * binSize;
+                }
+            }
+
+            // --- FILTRO DE RUÍDO 2: Threshold (Limiar de Amplitude) ---
+            // Só processa se o som for alto o suficiente (não é um ruído de fundo aleatório)
+            if (maxAmp > PROTOCOL.AMP_THRESHOLD) {
+                
+                // Se detectou o tom separador, apenas reseta a leitura e espera a próxima letra
+                if (Math.abs(peakFreq - PROTOCOL.FREQ_SEPARATOR) < (PROTOCOL.FREQ_STEP)) {
+                    lastChar = ''; 
+                } 
+                else if (peakFreq >= PROTOCOL.FREQ_BASE - PROTOCOL.FREQ_STEP) {
+                    // Tenta adivinhar qual caractere é com base na matemática inversa
+                    const charCode = Math.round((peakFreq - PROTOCOL.FREQ_BASE) / PROTOCOL.FREQ_STEP);
+                    
+                    if (charCode >= 32 && charCode <= 126) { // Tabela ASCII visível
+                        const decodedChar = String.fromCharCode(charCode);
+                        
+                        const now = Date.now();
+                        // Evita spam do mesmo caractere lido várias vezes no mesmo bipe
+                        if (decodedChar !== lastChar || (now - lastTime > PROTOCOL.DURATION * 1.5)) {
+                            rxOutput.textContent += decodedChar;
+                            lastChar = decodedChar;
+                            lastTime = now;
+                        }
+                    }
+                }
+            }
+
+            setTimeout(decodeAudio, 20); // Executa a leitura 50 vezes por segundo
+        }
+
+        // ==========================================
+        // VISUALIZADOR (CANVAS)
+        // ==========================================
+        function drawVisualizer() {
+            if (!isReceiving) {
+                canvasCtx.clearRect(0, 0, canvas.width, canvas.height);
+                return;
+            }
+
+            animationId = requestAnimationFrame(drawVisualizer);
+
+            const bufferLength = analyser.frequencyBinCount;
+            const dataArray = new Uint8Array(bufferLength);
+            analyser.getByteFrequencyData(dataArray);
+
+            canvasCtx.fillStyle = '#020617';
+            canvasCtx.fillRect(0, 0, canvas.width, canvas.height);
+
+            const barWidth = (canvas.width / bufferLength) * 8; // Zoom no espectro útil
+            let barHeight;
+            let x = 0;
+
+            // Pula as frequências baixas para focar visualmente apenas na área de dados
+            const startIndex = Math.floor(2000 / ((audioCtx.sampleRate / 2) / bufferLength));
+
+            for (let i = startIndex; i < bufferLength; i++) {
+                barHeight = dataArray[i] / 2;
+
+                // Cores dinâmicas (verde vibrante se passar do threshold)
+                if (dataArray[i] > PROTOCOL.AMP_THRESHOLD) {
+                    canvasCtx.fillStyle = '#10b981'; // Emerald
+                } else {
+                    canvasCtx.fillStyle = '#334155'; // Slate
+                }
+
+                canvasCtx.fillRect(x, canvas.height - barHeight, barWidth, barHeight);
+                x += barWidth + 1;
+                if (x > canvas.width) break;
+            }
+        }
+
+        // Ajusta tamanho do canvas dinamicamente
+        function resizeCanvas() {
+            canvas.width = canvas.clientWidth;
+            canvas.height = canvas.clientHeight;
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        document.getElementById('btn-clear').addEventListener('click', () => rxOutput.textContent = '');
+
+    </script>
+</body>
+</html>
